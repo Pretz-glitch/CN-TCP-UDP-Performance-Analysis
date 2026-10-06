@@ -4,7 +4,7 @@ Course: Computer Networks | Platform: Linux (Kubuntu) | Language: Python 3
 
 ## Status
 - [x] Phase 0: Prerequisites verified (see below)
-- [ ] Phase 1: Topology + bare transfers
+- [x] Phase 1: Topology + bare transfers (see below)
 - [ ] Phase 2: Real instrumentation
 - [ ] Phase 3: Automation + pilot
 - [ ] Phase 4: Full experiment sweeps (E1–E3)
@@ -27,6 +27,14 @@ Course: Computer Networks | Platform: Linux (Kubuntu) | Language: Python 3
   which is required anyway for `ip netns exec`. Retransmission fields
   (`tcp.analysis.retransmission`, `fast_retransmission`, etc.) confirmed present in tshark.
 
+## Phase 1 results (topology + bare transfers)
+- `setup/topology.sh` (idempotent), `setup/reset.sh`, `setup/netem.sh <delay_ms> <loss_pct> [rate_mbit]` — all working, committed `c944b21`.
+- Baseline ping (no impairment): ~0.08ms RTT, 0% loss, bidirectional.
+- Netem calibration (`netem.sh 50 1`): 100.5ms mean RTT (design: 50+50ms), 1% loss over 100 pings — exact match.
+- Bare TCP: 1,000,000/1,000,000 bytes at baseline and under 50ms/1% impairment.
+- Bare UDP: 834/834 datagrams (1 MB) at baseline; 84/84 after full teardown→rebuild.
+- No measurement instrumentation yet (timing, CSV, sequencing, pacing) — that is Phase 2.
+
 ## Layout
 - `client/` — tcp_client.py, udp_client.py
 - `server/` — tcp_server.py, udp_server.py
@@ -37,4 +45,15 @@ Course: Computer Networks | Platform: Linux (Kubuntu) | Language: Python 3
 - `captures/` — *.pcapng
 
 ## How to reproduce
-(TBD once implementation is complete.)
+```bash
+./setup/topology.sh            # build client -> router -> server testbed
+./setup/netem.sh 50 1          # ~100ms RTT, 1% loss client->server (0 0 = baseline)
+# TCP: server first, then client (run server in one shell, client in another)
+sudo ip netns exec server python3 server/tcp_server.py 50001
+sudo ip netns exec client python3 client/tcp_client.py 10.0.2.1 50001 1000000
+# UDP: same pattern
+sudo ip netns exec server python3 server/udp_server.py 50002
+sudo ip netns exec client python3 client/udp_client.py 10.0.2.1 50002 1000000
+./setup/reset.sh               # tear everything down
+```
+(Full experiment automation arrives in Phase 3.)
