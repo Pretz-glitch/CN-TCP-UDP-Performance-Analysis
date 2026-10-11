@@ -5,6 +5,7 @@ Course: Computer Networks | Platform: Linux (Kubuntu) | Language: Python 3
 ## Status
 - [x] Phase 0: Prerequisites verified (see below)
 - [x] Phase 1: Topology + bare transfers (see below)
+- [x] Phase 2: Real instrumentation (see below)
 - [ ] Phase 2: Real instrumentation
 - [ ] Phase 3: Automation + pilot
 - [ ] Phase 4: Full experiment sweeps (E1–E3)
@@ -35,6 +36,29 @@ Course: Computer Networks | Platform: Linux (Kubuntu) | Language: Python 3
 - Bare UDP: 834/834 datagrams (1 MB) at baseline; 84/84 after full teardown→rebuild.
 - No measurement instrumentation yet (timing, CSV, sequencing, pacing) — that is Phase 2.
 
+## Phase 2 results (instrumentation)
+- TCP: server records `t_first`/`t_last`, byte count, sends 1-byte app ACK; client
+  times connect→ACK. Both print `RESULT`/`SENDER` key=value lines (unbuffered).
+- UDP: 1200B payload + 8B header (seq, total); paced below bottleneck (default
+  8 Mbit/s); 16 MB `SO_RCVBUF` request (kernel grants 4 MB via rmem_max — plenty:
+  max in-flight is ~200 KB); 10x END marker + 3 s idle-timeout safety net.
+- Bug found by measurement: original client `close()`d before reading the ACK while
+  the server waited for close before ACKing — a close/ACK deadlock masked by
+  `timeout` kills. Fixed with `shutdown(SHUT_WR)` after sending. Lesson: every
+  earlier "success" was a mercy kill; always check server-side output, not just client exit.
+- Manual runs under `netem.sh 10 1` (20 ms RTT, 1% loss), 2 MB payload:
+  - TCP: transfer 2.570 s, client 2.612 s, goodput 6.226 Mbps (Mathis predicts ~8.9)
+  - UDP: 1667 sent / 1659 received (0.48% obs), goodput 7.734 Mbps, 0 dups, 0 ooo
+- Single-run UDP loss is noisy (8 vs ~17 expected at 1%); sweeps average it out in Phase 4.
+
+## CSV schema (one row per run, assembled by the Phase 3 driver)
+`protocol,delay_ms,loss_pct,trial,payload_bytes,transfer_time_s,client_time_s,goodput_mbps,bytes_delivered,packets_sent,packets_received,loss_pct_obs,duplicates,out_of_order`
+- Server stdout carries the `RESULT` line (server-side fields); client stdout carries
+  the `SENDER` line (`client_time_s` for TCP, `packets_sent` for UDP). Empty = n/a.
+- Example merged row:
+  `tcp,10,1,1,2000000,2.570001,2.612103,6.226,2000000,,,,,`
+  `udp,10,1,1,2000000,2.058791,,7.734,1990400,1667,1659,0.480,0,0`
+
 ## Layout
 - `client/` — tcp_client.py, udp_client.py
 - `server/` — tcp_server.py, udp_server.py
@@ -51,9 +75,9 @@ Course: Computer Networks | Platform: Linux (Kubuntu) | Language: Python 3
 # TCP: server first, then client (run server in one shell, client in another)
 sudo ip netns exec server python3 server/tcp_server.py 50001
 sudo ip netns exec client python3 client/tcp_client.py 10.0.2.1 50001 1000000
-# UDP: same pattern
+# UDP: same pattern (optional 4th client arg = pacing rate in bit/s)
 sudo ip netns exec server python3 server/udp_server.py 50002
-sudo ip netns exec client python3 client/udp_client.py 10.0.2.1 50002 1000000
+sudo ip netns exec client python3 client/udp_client.py 10.0.2.1 50002 2000000 8000000
 ./setup/reset.sh               # tear everything down
 ```
 (Full experiment automation arrives in Phase 3.)
