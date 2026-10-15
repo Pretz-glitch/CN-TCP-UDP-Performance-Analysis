@@ -42,6 +42,9 @@ Course: Computer Networks | Platform: Linux (Kubuntu) | Language: Python 3
 - UDP: 1200B payload + 8B header (seq, total); paced below bottleneck (default
   8 Mbit/s); 16 MB `SO_RCVBUF` request (kernel grants 4 MB via rmem_max — plenty:
   max in-flight is ~200 KB); 10x END marker + 3 s idle-timeout safety net.
+  Two-stage timeout: 30 s startup window for the first datagram (time to start
+  the client manually), then 3 s idle timeout once running; no data in 30 s is
+  a loud failure (exit 1, no RESULT line) so the driver can flag the run.
 - Bug found by measurement: original client `close()`d before reading the ACK while
   the server waited for close before ACKing — a close/ACK deadlock masked by
   `timeout` kills. Fixed with `shutdown(SHUT_WR)` after sending. Lesson: every

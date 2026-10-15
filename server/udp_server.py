@@ -15,7 +15,8 @@ import time
 HDR = struct.Struct("!II")  # seq, total
 END_SEQ = 0xFFFFFFFF
 RCVBUF = 16 * 1024 * 1024
-IDLE_TIMEOUT = 3.0
+STARTUP_TIMEOUT = 30.0  # wait this long for the FIRST datagram (time to start the client)
+IDLE_TIMEOUT = 3.0      # once started, finish after this long with no datagrams
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 50002
 
@@ -23,7 +24,7 @@ srv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 srv.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, RCVBUF)
 actual_buf = srv.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
 srv.bind(("0.0.0.0", PORT))
-srv.settimeout(IDLE_TIMEOUT)
+srv.settimeout(STARTUP_TIMEOUT)  # generous window until the first datagram
 
 seen = {}  # seq -> payload length (first arrival wins)
 duplicates = 0
@@ -32,12 +33,22 @@ max_seq = -1
 expected = None
 t_first = None
 t_last = None
+started = False
 
 while True:
     try:
         data, _ = srv.recvfrom(65535)
     except socket.timeout:
-        break
+        if not started:
+            # Client never showed up: fail loudly, no RESULT line (driver
+            # treats a missing RESULT + nonzero exit as a failed run).
+            print("UDP_SERVER_ERROR no datagrams within startup window", flush=True)
+            srv.close()
+            sys.exit(1)
+        break  # idle timeout after start: experiment is over
+    if not started:
+        started = True
+        srv.settimeout(IDLE_TIMEOUT)  # now the idle timeout governs the end
     now = time.perf_counter()
     if len(data) < HDR.size:
         continue
