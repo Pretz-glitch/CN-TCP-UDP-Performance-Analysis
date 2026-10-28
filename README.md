@@ -6,8 +6,7 @@ Course: Computer Networks | Platform: Linux (Kubuntu) | Language: Python 3
 - [x] Phase 0: Prerequisites verified (see below)
 - [x] Phase 1: Topology + bare transfers (see below)
 - [x] Phase 2: Real instrumentation (see below)
-- [ ] Phase 2: Real instrumentation
-- [ ] Phase 3: Automation + pilot
+- [x] Phase 3: Automation + pilot (see below)
 - [ ] Phase 4: Full experiment sweeps (E1–E3)
 - [ ] Phase 5: Analysis and graphs
 - [ ] Phase 6: Report
@@ -54,13 +53,29 @@ Course: Computer Networks | Platform: Linux (Kubuntu) | Language: Python 3
   - UDP: 1667 sent / 1659 received (0.48% obs), goodput 7.734 Mbps, 0 dups, 0 ooo
 - Single-run UDP loss is noisy (8 vs ~17 expected at 1%); sweeps average it out in Phase 4.
 
+## Phase 3 results (automation + pilot)
+- Built `experiments/run_experiment.py` orchestrating end-to-end runs:
+  - Automates topology verification and per-trial `netem` configuration.
+  - Background `tshark` packet captures on sender interface `client:c-r` with clean SIGINT finalization.
+  - Client/server process lifecycle with stdout `RESULT` and `SENDER` line aggregation.
+  - Cross-validates TCP retransmissions between `tshark` (`tcp.analysis.retransmission || tcp.analysis.fast_retransmission`) and kernel SNMP counters (`nstat -az TcpRetransSegs`).
+  - Graceful timeout handling, automated cleanup, and `--dry-run` validation.
+- Pilot execution verified across 6 testbed conditions (Baseline, 50ms RTT, 20ms RTT with 1% loss):
+  - **Baseline (0ms, 0%)**: TCP 9.571 Mbps goodput (0 retrans); UDP 7.771 Mbps (0% loss, 0 ooo/dups).
+  - **Added Delay (50ms RTT, 0%)**: TCP 9.181 Mbps; UDP 7.771 Mbps.
+  - **Added Loss (20ms RTT, 1% loss, 5 MB)**:
+    - TCP: 5.596 Mbps goodput, exactly 34 retransmissions counted by `tshark` and 34 by kernel SNMP (`TcpRetransSegs`).
+    - UDP: 7.679 Mbps goodput, 1.152% observed loss (closely tracking configured 1%), 0 out-of-order, 0 duplicates.
+  - All 6 `.pcapng` traces cleanly captured and stored in `captures/`.
+  - Merged run records successfully written to `results/raw_results.csv`.
+
 ## CSV schema (one row per run, assembled by the Phase 3 driver)
-`protocol,delay_ms,loss_pct,trial,payload_bytes,transfer_time_s,client_time_s,goodput_mbps,bytes_delivered,packets_sent,packets_received,loss_pct_obs,duplicates,out_of_order`
+`protocol,delay_ms,loss_pct,trial,payload_bytes,transfer_time_s,client_time_s,goodput_mbps,bytes_delivered,packets_sent,packets_received,loss_pct_obs,duplicates,out_of_order,retrans_tshark,retrans_kernel`
 - Server stdout carries the `RESULT` line (server-side fields); client stdout carries
   the `SENDER` line (`client_time_s` for TCP, `packets_sent` for UDP). Empty = n/a.
 - Example merged row:
-  `tcp,10,1,1,2000000,2.570001,2.612103,6.226,2000000,,,,,`
-  `udp,10,1,1,2000000,2.058791,,7.734,1990400,1667,1659,0.480,0,0`
+  `tcp,10,1,1,2000000,2.570001,2.612103,6.226,2000000,,,,,,34,34`
+  `udp,10,1,1,2000000,2.058791,,7.734,1990400,1667,1659,0.480,0,0,,`
 
 ## Layout
 - `client/` — tcp_client.py, udp_client.py
@@ -75,12 +90,19 @@ Course: Computer Networks | Platform: Linux (Kubuntu) | Language: Python 3
 ```bash
 ./setup/topology.sh            # build client -> router -> server testbed
 ./setup/netem.sh 50 1          # ~100ms RTT, 1% loss client->server (0 0 = baseline)
-# TCP: server first, then client (run server in one shell, client in another)
+# Manual TCP transfer
 sudo ip netns exec server python3 server/tcp_server.py 50001
 sudo ip netns exec client python3 client/tcp_client.py 10.0.2.1 50001 1000000
-# UDP: same pattern (optional 4th client arg = pacing rate in bit/s)
+# Manual UDP transfer (optional 4th arg = pacing rate in bit/s)
 sudo ip netns exec server python3 server/udp_server.py 50002
 sudo ip netns exec client python3 client/udp_client.py 10.0.2.1 50002 2000000 8000000
+
+# Automated sweeps (Phase 3)
+python3 experiments/run_experiment.py --set pilot    # 6 calibration runs
+python3 experiments/run_experiment.py --set E1       # Baseline sweep (5 trials)
+python3 experiments/run_experiment.py --set E2       # Delay sweep (RTT 0..200ms, 5 trials)
+python3 experiments/run_experiment.py --set E3       # Loss sweep (0..5%, 10MB, 5 trials)
+python3 experiments/run_experiment.py --set all      # Full 90-run sweep (E1..E3)
+
 ./setup/reset.sh               # tear everything down
 ```
-(Full experiment automation arrives in Phase 3.)
