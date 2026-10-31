@@ -1,7 +1,7 @@
-protocol,delay_ms,loss_pct,trial,payload_bytes,transfer_time_s,client_time_s,goodput_mbps,bytes_delivered,packets_sent,packets_received,loss_pct_obs,duplicates,out_of_order,retrans_tshark,retrans_kernel
-tcp,0,0.0,1,2000000,1.671728,1.673559,9.571,2000000,,,,,,0,0
-udp,0,0.0,1,2000000,2.058939,,7.771,2000000,1667,1667,0.000,0,0,,
-tcp,25,0.0,1,2000000,1.742716,1.845357,9.181,2000000,,,,,,0,0
-udp,25,0.0,1,2000000,2.058957,,7.771,2000000,1667,1667,0.000,0,0,,
-tcp,10,1.0,1,5000000,7.147431,7.189450,5.596,5000000,,,,,,34,34
-udp,10,1.0,1,5000000,5.148986,,7.679,4942400,4167,4119,1.152,0,0,,
+protocol,delay_ms,added_rtt_ms,loss_pct,trial,payload_bytes,transfer_time_s,client_time_s,goodput_mbps,bytes_delivered,packets_sent,packets_received,loss_pct_obs,duplicates,out_of_order,retrans_tshark,retrans_kernel
+tcp,0,0,0.0,1,2000000,1.671729,1.673581,9.571,2000000,,,,,,0,0
+udp,0,0,0.0,1,2000000,2.058866,2.060684,7.771,2000000,1667,1667,0.000,0,0,,
+tcp,25,50,0.0,1,2000000,1.742864,1.845967,9.180,2000000,,,,,,0,0
+udp,25,50,0.0,1,2000000,2.058973,2.060739,7.771,2000000,1667,1667,0.000,0,0,,
+tcp,10,20,1.0,1,5000000,6.299007,6.341634,6.350,5000000,,,,,,27,27
+udp,10,20,1.0,1,5000000,5.148808,5.150704,7.666,4934000,4167,4112,1.320,0,0,,

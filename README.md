@@ -62,20 +62,39 @@ Course: Computer Networks | Platform: Linux (Kubuntu) | Language: Python 3
   - Graceful timeout handling, automated cleanup, and `--dry-run` validation.
 - Pilot execution verified across 6 testbed conditions (Baseline, 50ms RTT, 20ms RTT with 1% loss):
   - **Baseline (0ms, 0%)**: TCP 9.571 Mbps goodput (0 retrans); UDP 7.771 Mbps (0% loss, 0 ooo/dups).
-  - **Added Delay (50ms RTT, 0%)**: TCP 9.181 Mbps; UDP 7.771 Mbps.
+  - **Added Delay (50ms RTT, 0%)**: TCP 9.180 Mbps; UDP 7.771 Mbps.
   - **Added Loss (20ms RTT, 1% loss, 5 MB)**:
-    - TCP: 5.596 Mbps goodput, exactly 34 retransmissions counted by `tshark` and 34 by kernel SNMP (`TcpRetransSegs`).
-    - UDP: 7.679 Mbps goodput, 1.152% observed loss (closely tracking configured 1%), 0 out-of-order, 0 duplicates.
-  - All 6 `.pcapng` traces cleanly captured and stored in `captures/`.
-  - Merged run records successfully written to `results/raw_results.csv`.
+    - TCP: 6.350 Mbps goodput, 27 retransmissions by `tshark` and 27 by kernel SNMP (`TcpRetransSegs`).
+    - UDP: 7.666 Mbps goodput, 1.320% observed loss, 0 out-of-order, 0 duplicates.
+  - All 6 `.pcapng` traces captured to `captures/` (gitignored — regenerate with the runner).
+  - Merged run records written to `results/raw_results.csv`.
+- `--set all` plans **90 runs**: E1 baseline (10) + E2 delay sweep 0/25/50/100 ms (30) + E3 loss sweep 0/0.5/1/2/5% (50).
+
+### Phase 3 verification: defects found and fixed
+A line-by-line audit plus independent replay of the committed captures found seven real problems:
+1. **Timeout budget was too small for E3.** The budget divided by the UDP pacing rate for both protocols. Measured E3 worst case (10 MB, 5% loss, 20 ms RTT) = **44.9 s against a 45 s budget**. Replaced with a per-protocol model: Mathis approximation (`BW ≈ MSS/RTT × 1/√p`) for TCP, pacing time for UDP, `max(60, 3×est + 60)`. New budget for that case is **161 s** (3.6× headroom).
+2. **Timeout kills orphaned processes.** `proc.kill()` kills only `sudo`; the root-owned python child kept running inside the namespace (confirmed empirically: the child survived `SIGKILL` to sudo and would corrupt later trials). Now every child starts with `start_new_session=True` and is signalled as a process group via `sudo kill -s SIGKILL -- -PGID`. Verified: forced-timeout run leaves zero processes/sockets behind.
+   - Sub-note: `kill -SIGKILL -PGID` silently fails (negative PID parsed as options); the `-s SIG … --` form is required.
+3. **CSV schema corruption.** The old appender inspected the existing header and used `extrasaction="ignore"`, so appending to the 16-column legacy CSV **silently dropped `added_rtt_ms` from every new row**. Now a header mismatch triggers an in-place migration (with `.bak`), backfilling `added_rtt_ms = 2 × delay_ms`. `results/raw_results.csv` was regenerated under the new schema.
+4. **Counter failures reported as zero.** `nstat`/`tshark` errors returned `0`, indistinguishable from "no retransmissions". They now return `None` and the cell is left empty with a warning.
+5. **Capture-start race.** A fixed `sleep(0.5)` after launching tshark could truncate the start of a run (SYN/first segments). Now the runner polls until the capture file exists and is non-empty (10 s limit).
+6. **Retransmission filter spanned both directions.** The capture on `client:c-r` sees server→client traffic too. Filter now restricts to `ip.src == 10.0.1.1`. Re-verified against the old capture: still 34 (the 21 `fast_retransmission` frames are a *subset* of the 34, not additive — no double counting).
+7. **19 MB of `.pcapng` artifacts were committed** because `.gitignore` listed only `*.pcap`. Captures are now untracked and ignored; they stay on disk locally.
+
+Cross-validation holds: for the 1%-loss pilot, tshark and the kernel counter agree exactly (27 = 27), and at 5% loss a 10 MB transfer measured 1.827 Mbps, below the Mathis estimate of 2.61 Mbps — expected, since Mathis ignores RTO backoff.
 
 ## CSV schema (one row per run, assembled by the Phase 3 driver)
-`protocol,delay_ms,loss_pct,trial,payload_bytes,transfer_time_s,client_time_s,goodput_mbps,bytes_delivered,packets_sent,packets_received,loss_pct_obs,duplicates,out_of_order,retrans_tshark,retrans_kernel`
-- Server stdout carries the `RESULT` line (server-side fields); client stdout carries
-  the `SENDER` line (`client_time_s` for TCP, `packets_sent` for UDP). Empty = n/a.
-- Example merged row:
-  `tcp,10,1,1,2000000,2.570001,2.612103,6.226,2000000,,,,,,34,34`
-  `udp,10,1,1,2000000,2.058791,,7.734,1990400,1667,1659,0.480,0,0,,`
+`protocol,delay_ms,added_rtt_ms,loss_pct,trial,payload_bytes,transfer_time_s,client_time_s,goodput_mbps,bytes_delivered,packets_sent,packets_received,loss_pct_obs,duplicates,out_of_order,retrans_tshark,retrans_kernel`
+- `delay_ms`: configured one-way delay per direction in netem.
+- `added_rtt_ms`: total added round-trip time ($2 \times \text{delay\_ms}$), confirmed symmetric on router interfaces `r-s` and `r-c`.
+- `client_time_s`: sender-side duration.
+  - TCP: round-trip connect -> data transfer -> close write -> app ACK received.
+  - UDP: unidirectional transmission loop duration (first datagram -> final END marker).
+- Server stdout carries the `RESULT` line; client stdout carries the `SENDER` line. Empty = n/a.
+- Empty cell = not applicable (e.g. `packets_sent`/`loss_pct_obs` for TCP, `retrans_*` for UDP).
+- Example merged rows (from the verified pilot):
+  `tcp,10,20,1.0,1,5000000,6.299007,6.341634,6.350,5000000,,,,,,27,27`
+  `udp,10,20,1.0,1,5000000,5.148808,5.150704,7.666,4934000,4167,4112,1.320,0,0,,`
 
 ## Layout
 - `client/` — tcp_client.py, udp_client.py
@@ -103,6 +122,11 @@ python3 experiments/run_experiment.py --set E1       # Baseline sweep (5 trials)
 python3 experiments/run_experiment.py --set E2       # Delay sweep (RTT 0..200ms, 5 trials)
 python3 experiments/run_experiment.py --set E3       # Loss sweep (0..5%, 10MB, 5 trials)
 python3 experiments/run_experiment.py --set all      # Full 90-run sweep (E1..E3)
+python3 experiments/run_experiment.py --set all --dry-run   # print plan, write nothing
 
 ./setup/reset.sh               # tear everything down
 ```
+Captures in `captures/` are generated artifacts and are gitignored (19 MB for the
+pilot alone); re-run the suite to recreate them. `results/*.csv` **is** tracked —
+that is the dataset. Run the suite in one go: the runner manages topology, netem,
+capture, process lifecycle and CSV appends, and leaves netem unshaped at the end.

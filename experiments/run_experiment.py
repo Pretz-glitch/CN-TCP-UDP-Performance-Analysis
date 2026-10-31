@@ -16,6 +16,7 @@ Usage:
 """
 import argparse
 import csv
+import math
 import os
 import re
 import shutil
@@ -34,9 +35,13 @@ CLIENT_DIR = PROJECT_ROOT / "client"
 RESULTS_DIR = PROJECT_ROOT / "results"
 CAPTURES_DIR = PROJECT_ROOT / "captures"
 
+CLIENT_IP = "10.0.1.1"
+SERVER_IP = "10.0.2.1"
+
 CSV_FIELDS = [
     "protocol",
     "delay_ms",
+    "added_rtt_ms",
     "loss_pct",
     "trial",
     "payload_bytes",
@@ -109,46 +114,115 @@ def apply_netem(delay_ms: int, loss_pct: float, rate_mbit: int = 10) -> None:
     run_command(cmd, check=True)
 
 
-def get_kernel_tcp_retrans() -> int:
-    """Read TcpRetransSegs counter from client namespace."""
+def get_kernel_tcp_retrans() -> Optional[int]:
+    """Read the cumulative TcpRetransSegs counter from the client namespace.
+
+    Returns None (not 0) when the counter cannot be read, so a missing tool or a
+    failed command is never silently reported as "zero retransmissions".
+    """
     prefix = get_prefix()
     cmd = prefix + ["ip", "netns", "exec", "client", "nstat", "-az", "TcpRetransSegs"]
     try:
-        res = run_command(cmd, check=False)
-        if res.returncode == 0:
-            for line in res.stdout.splitlines():
-                parts = line.strip().split()
-                if len(parts) >= 2 and parts[0] == "TcpRetransSegs":
-                    return int(parts[1])
-    except Exception:
-        pass
-    return 0
+        res = run_command(cmd, check=False, timeout=10)
+        if res.returncode != 0:
+            print(f"  [WARN] nstat failed (rc={res.returncode}): {res.stderr.strip()[:200]}")
+            return None
+        for line in res.stdout.splitlines():
+            parts = line.strip().split()
+            if len(parts) >= 2 and parts[0] == "TcpRetransSegs":
+                return int(parts[1])
+        print("  [WARN] TcpRetransSegs not present in nstat output")
+    except Exception as exc:
+        print(f"  [WARN] kernel retransmission counter unavailable: {exc}")
+    return None
 
 
-def count_tshark_retrans(pcap_path: Path) -> int:
-    """Count retransmissions in pcap using tshark display filter."""
+def count_tshark_retrans(pcap_path: Path) -> Optional[int]:
+    """Count sender-side TCP retransmissions in a pcap.
+
+    Filtered to CLIENT_IP so the capture's server->client direction (ACKs and
+    the occasional server retransmission) cannot inflate the sender's count.
+    Returns None if the capture is missing/unreadable rather than 0.
+    """
     if not pcap_path.exists() or pcap_path.stat().st_size == 0:
-        return 0
+        print(f"  [WARN] capture missing or empty: {pcap_path.name}")
+        return None
     prefix = get_prefix()
     cmd = prefix + [
         "tshark", "-r", str(pcap_path),
-        "-Y", "tcp.analysis.retransmission || tcp.analysis.fast_retransmission",
+        "-Y", f"(tcp.analysis.retransmission || tcp.analysis.fast_retransmission) && ip.src == {CLIENT_IP}",
         "-T", "fields", "-e", "frame.number"
     ]
     try:
-        res = run_command(cmd, check=False)
-        if res.returncode == 0:
-            frames = [f.strip() for f in res.stdout.splitlines() if f.strip()]
-            return len(frames)
-    except Exception:
-        pass
-    return 0
+        res = run_command(cmd, check=False, timeout=120)
+        if res.returncode != 0:
+            print(f"  [WARN] tshark failed (rc={res.returncode}): {res.stderr.strip()[:200]}")
+            return None
+        return len([f for f in res.stdout.splitlines() if f.strip()])
+    except Exception as exc:
+        print(f"  [WARN] tshark retransmission count unavailable: {exc}")
+    return None
+
+
+def estimate_timeout(cfg: "ExperimentConfig") -> float:
+    """Generous per-trial timeout budget in seconds.
+
+    The previous version divided by the UDP pacing rate for BOTH protocols, which
+    underestimated TCP badly: the E3 worst case (10 MB @ 5% loss, 20 ms RTT)
+    measured 44.9 s against a computed budget of exactly 45 s. TCP throughput
+    here is modelled with the Mathis approximation (BW ~ MSS/RTT * 1/sqrt(p)),
+    which ignores RTO backoff, hence the wide safety factor on top.
+    """
+    rtt_s = max(0.001, (2 * cfg.delay_ms) / 1000.0 + 0.002)
+    if cfg.protocol == "udp":
+        est = (cfg.payload_bytes * 8) / max(1, cfg.rate_bps)  # pacing is deterministic
+    else:
+        p = max(cfg.loss_pct / 100.0, 1e-4)
+        bw_bps = (1460 * 8 / rtt_s) / math.sqrt(p)            # Mathis approximation
+        bw_bps = min(bw_bps, cfg.rate_mbit * 1_000_000)       # cannot beat the bottleneck
+        est = (cfg.payload_bytes * 8) / max(1.0, bw_bps)
+    return max(60.0, est * 3.0 + 60.0)
+
+
+def kill_tree(proc: Optional[subprocess.Popen], sig: int = signal.SIGKILL, grace: float = 5.0) -> None:
+    """Signal the whole process group of a sudo-launched command.
+
+    `proc.kill()` only kills `sudo`; the root-owned python child keeps running
+    inside the namespace (verified empirically) and can pollute later trials.
+    Processes are started with start_new_session=True so proc.pid is the pgid,
+    and the signal is sent through sudo so root-owned members are reachable.
+    """
+    if proc is None or proc.poll() is not None:
+        return
+    prefix = get_prefix()
+    # NOTE: the negative pid must follow `--`; `kill -SIGKILL -123` is silently
+    # parsed as options and leaves the group alive (verified on this box).
+    subprocess.run(prefix + ["kill", "-s", sig.name, "--", f"-{proc.pid}"], check=False)
+    try:
+        proc.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        subprocess.run(prefix + ["kill", "-s", "SIGKILL", "--", f"-{proc.pid}"], check=False)
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            pass
 
 
 def parse_kv_line(line: str) -> Dict[str, str]:
     """Parse key=value pairs from RESULT or SENDER lines."""
     matches = re.findall(r'(\w+)=([^\s]*)', line)
     return {k: v for k, v in matches}
+
+
+def extract_metric(sender: Dict[str, str], result: Dict[str, str], key: str) -> str:
+    """Extract metric value, distinguishing a valid zero ('0', '0.000') from missing ('')."""
+    val = sender.get(key)
+    if val is not None and val != "":
+        return val
+    val = result.get(key)
+    if val is not None and val != "":
+        return val
+    return ""
 
 
 def run_single_trial(
@@ -172,6 +246,7 @@ def run_single_trial(
         return {
             "protocol": cfg.protocol,
             "delay_ms": str(cfg.delay_ms),
+            "added_rtt_ms": str(2 * cfg.delay_ms),
             "loss_pct": str(cfg.loss_pct),
             "trial": str(cfg.trial),
             "payload_bytes": str(cfg.payload_bytes),
@@ -192,7 +267,7 @@ def run_single_trial(
     apply_netem(cfg.delay_ms, cfg.loss_pct, cfg.rate_mbit)
 
     # 2. Kernel retransmission counter before run
-    retrans_before = get_kernel_tcp_retrans() if cfg.protocol == "tcp" else 0
+    retrans_before = get_kernel_tcp_retrans() if cfg.protocol == "tcp" else None
 
     # 3. Start packet capture (staged in /tmp to avoid root-mount permissions)
     tshark_proc = None
@@ -212,8 +287,22 @@ def run_single_trial(
             tshark_cmd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            start_new_session=True,
         )
-        time.sleep(0.5)  # Allow tshark to attach
+        # Wait until tshark has actually created the file instead of guessing a
+        # fixed sleep: a slow attach would silently truncate the start of the run
+        # (the SYN and first segments).
+        deadline = time.time() + 10.0
+        while time.time() < deadline:
+            if tmp_pcap.exists() and tmp_pcap.stat().st_size > 0:
+                break
+            if tshark_proc.poll() is not None:
+                print("  [WARN] tshark exited during startup; capture disabled for this run")
+                tshark_proc = None
+                break
+            time.sleep(0.05)
+        else:
+            print("  [WARN] tshark did not create the capture file within 10s")
 
     # 4. Start server
     server_script = SERVER_DIR / f"{cfg.protocol}_server.py"
@@ -226,6 +315,7 @@ def run_single_trial(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        start_new_session=True,
     )
     time.sleep(0.2)  # Allow server to bind and listen
 
@@ -233,14 +323,14 @@ def run_single_trial(
     client_script = CLIENT_DIR / f"{cfg.protocol}_client.py"
     client_cmd = prefix + [
         "ip", "netns", "exec", "client",
-        sys.executable, str(client_script), "10.0.2.1", str(cfg.port), str(cfg.payload_bytes)
+        sys.executable, str(client_script), SERVER_IP, str(cfg.port), str(cfg.payload_bytes)
     ]
     if cfg.protocol == "udp":
         client_cmd.append(str(cfg.rate_bps))
 
-    # Calculate timeout based on transfer size and rate (minimum 30s)
-    est_transfer_time = (cfg.payload_bytes * 8) / min(cfg.rate_bps, cfg.rate_mbit * 1_000_000)
-    timeout = max(35.0, est_transfer_time * 3 + 15.0)
+    # Per-protocol timeout budget (see estimate_timeout docstring).
+    timeout = estimate_timeout(cfg)
+    print(f"  [i] timeout budget: {timeout:.0f}s")
 
     sender_data: Dict[str, str] = {}
     result_data: Dict[str, str] = {}
@@ -252,6 +342,7 @@ def run_single_trial(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            start_new_session=True,
         )
         c_stdout, c_stderr = client_proc.communicate(timeout=timeout)
         s_stdout, s_stderr = server_proc.communicate(timeout=timeout)
@@ -273,24 +364,18 @@ def run_single_trial(
             return None
 
     except subprocess.TimeoutExpired as exc:
-        print(f"  [TIMEOUT] Run exceeded {timeout}s: {exc}")
-        if client_proc:
-            client_proc.kill()
-        server_proc.kill()
+        print(f"  [TIMEOUT] Run exceeded {timeout:.0f}s: {exc}")
+        # Kill the whole process group, not just sudo: otherwise the root-owned
+        # python child survives inside the namespace and corrupts later trials.
+        kill_tree(client_proc)
+        kill_tree(server_proc)
         return None
     finally:
-        # Stop tshark
+        # Stop tshark with SIGINT so it flushes the pcap, then force if needed.
         if tshark_proc and tshark_proc.poll() is None:
-            # Send SIGINT to tshark (via sudo if running unprivileged)
-            subprocess.run(prefix + ["kill", "-INT", str(tshark_proc.pid)], check=False)
-            try:
-                tshark_proc.wait(timeout=5)
-            except Exception:
-                subprocess.run(prefix + ["kill", "-KILL", str(tshark_proc.pid)], check=False)
-                try:
-                    tshark_proc.wait(timeout=2)
-                except Exception:
-                    pass
+            kill_tree(tshark_proc, sig=signal.SIGINT, grace=8.0)
+        # Any lingering server (e.g. after a parse failure) must not hold the port.
+        kill_tree(server_proc, sig=signal.SIGTERM, grace=3.0)
 
         # Move staged capture from /tmp to captures/
         if enable_capture and tmp_pcap.exists():
@@ -307,22 +392,26 @@ def run_single_trial(
     retrans_tshark_count = ""
     if cfg.protocol == "tcp":
         retrans_after = get_kernel_tcp_retrans()
-        retrans_kernel_count = str(max(0, retrans_after - retrans_before))
+        if retrans_before is not None and retrans_after is not None:
+            retrans_kernel_count = str(max(0, retrans_after - retrans_before))
         if enable_capture:
-            retrans_tshark_count = str(count_tshark_retrans(pcap_path))
+            tshark_count = count_tshark_retrans(pcap_path)
+            if tshark_count is not None:
+                retrans_tshark_count = str(tshark_count)
 
     # 7. Merge into standard CSV row
     row: Dict[str, str] = {
         "protocol": cfg.protocol,
         "delay_ms": str(cfg.delay_ms),
+        "added_rtt_ms": str(2 * cfg.delay_ms),
         "loss_pct": str(cfg.loss_pct),
         "trial": str(cfg.trial),
         "payload_bytes": str(cfg.payload_bytes),
         "transfer_time_s": result_data.get("transfer_time_s", ""),
-        "client_time_s": sender_data.get("client_time_s", result_data.get("client_time_s", "")),
+        "client_time_s": extract_metric(sender_data, result_data, "client_time_s"),
         "goodput_mbps": result_data.get("goodput_mbps", ""),
         "bytes_delivered": result_data.get("bytes_delivered", ""),
-        "packets_sent": sender_data.get("packets_sent", result_data.get("packets_sent", "")),
+        "packets_sent": extract_metric(sender_data, result_data, "packets_sent"),
         "packets_received": result_data.get("packets_received", ""),
         "loss_pct_obs": result_data.get("loss_pct_obs", ""),
         "duplicates": result_data.get("duplicates", ""),
@@ -331,8 +420,8 @@ def run_single_trial(
         "retrans_kernel": retrans_kernel_count,
     }
 
-    print(f"  => transfer={row['transfer_time_s']}s goodput={row['goodput_mbps']}Mbps "
-          f"delivered={row['bytes_delivered']}B", end="")
+    print(f"  => transfer={row['transfer_time_s']}s client={row['client_time_s']}s "
+          f"goodput={row['goodput_mbps']}Mbps delivered={row['bytes_delivered']}B", end="")
     if cfg.protocol == "tcp":
         print(f" retrans(tshark={row['retrans_tshark']}, kernel={row['retrans_kernel']})")
     else:
@@ -343,13 +432,53 @@ def run_single_trial(
     return row
 
 
+def migrate_csv(csv_path: Path) -> int:
+    """Rewrite an existing CSV so its header exactly matches CSV_FIELDS.
+
+    Older runs used a shorter header (no added_rtt_ms). Appending with the old
+    header silently DROPPED the new column, so the file no longer matched the
+    documented schema. This migrates in place (with a .bak backup), backfilling
+    added_rtt_ms from delay_ms where it is derivable. Returns rows migrated.
+    """
+    backup = csv_path.with_suffix(csv_path.suffix + ".bak")
+    shutil.copyfile(csv_path, backup)
+    with open(csv_path, mode="r", newline="") as f:
+        rows = list(csv.DictReader(f))
+    with open(csv_path, mode="w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+        writer.writeheader()
+        for old in rows:
+            new = {k: old.get(k, "") for k in CSV_FIELDS}
+            if not new["added_rtt_ms"] and new["delay_ms"]:
+                try:
+                    new["added_rtt_ms"] = str(2 * int(float(new["delay_ms"])))
+                except ValueError:
+                    pass
+            writer.writerow(new)
+    print(f"  [WARN] CSV header did not match schema; migrated {len(rows)} rows "
+          f"(backup: {backup.name})")
+    return len(rows)
+
+
 def append_csv_row(csv_path: Path, row: Dict[str, str]) -> None:
-    """Append a single row to the results CSV."""
+    """Append one row, guaranteeing the file's header matches CSV_FIELDS.
+
+    A schema mismatch is migrated rather than silently truncated: previously
+    extrasaction='ignore' meant a legacy 16-column file would drop added_rtt_ms
+    from every new row, corrupting the dataset without any error.
+    """
     csv_path.parent.mkdir(parents=True, exist_ok=True)
-    write_header = not csv_path.exists() or csv_path.stat().st_size == 0
+    exists = csv_path.exists() and csv_path.stat().st_size > 0
+
+    if exists:
+        with open(csv_path, mode="r", newline="") as f:
+            existing_header = next(csv.reader(f), None)
+        if existing_header != CSV_FIELDS:
+            migrate_csv(csv_path)
+
     with open(csv_path, mode="a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
-        if write_header:
+        if not exists:
             writer.writeheader()
         writer.writerow(row)
 
@@ -512,7 +641,8 @@ def main():
                 dry_run=args.dry_run,
             )
             if row:
-                append_csv_row(csv_path, row)
+                if not args.dry_run:
+                    append_csv_row(csv_path, row)
                 successful_runs += 1
             else:
                 failed_runs += 1
@@ -527,7 +657,10 @@ def main():
 
     print("\n" + "=" * 70)
     print(f" EXPERIMENT COMPLETE: {successful_runs} successful, {failed_runs} failed.")
-    print(f" Results written to: {csv_path}")
+    if not args.dry_run:
+        print(f" Results written to: {csv_path}")
+    else:
+        print(f" [DRY-RUN] Verification complete. No CSV files or captures were modified.")
     print("=" * 70)
 
 
