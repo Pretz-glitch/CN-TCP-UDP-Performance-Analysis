@@ -60,18 +60,21 @@ Course: Computer Networks | Platform: Linux (Kubuntu) | Language: Python 3
   - Client/server process lifecycle with stdout `RESULT` and `SENDER` line aggregation.
   - Cross-validates TCP retransmissions between `tshark` (`tcp.analysis.retransmission || tcp.analysis.fast_retransmission`) and kernel SNMP counters (`nstat -az TcpRetransSegs`).
   - Graceful timeout handling, automated cleanup, and `--dry-run` validation.
-- Pilot execution verified across 6 testbed conditions (Baseline, 50ms RTT, 20ms RTT with 1% loss):
-  - **Baseline (0ms, 0%)**: TCP 9.571 Mbps goodput (0 retrans); UDP 7.771 Mbps (0% loss, 0 ooo/dups).
-  - **Added Delay (50ms RTT, 0%)**: TCP 9.180 Mbps; UDP 7.771 Mbps.
+- Pilot re-executed from a clean slate (namespaces deleted, results/captures wiped) after all fixes;
+  every number below is from that final run:
+  - **Baseline (0ms, 0%)**: TCP 9.570 Mbps goodput (0 retrans); UDP 7.772 Mbps (0% loss, 0 ooo/dups).
+  - **Added Delay (50ms RTT, 0%)**: TCP 9.181 Mbps; UDP 7.772 Mbps.
   - **Added Loss (20ms RTT, 1% loss, 5 MB)**:
-    - TCP: 6.350 Mbps goodput, 27 retransmissions by `tshark` and 27 by kernel SNMP (`TcpRetransSegs`).
-    - UDP: 7.666 Mbps goodput, 1.320% observed loss, 0 out-of-order, 0 duplicates.
+    - TCP: 5.336 Mbps goodput, 38 retransmissions by `tshark` and 38 by kernel SNMP.
+    - UDP: 7.718 Mbps goodput, 0.648% observed loss, 0 out-of-order, 0 duplicates.
   - All 6 `.pcapng` traces captured to `captures/` (gitignored — regenerate with the runner).
-  - Merged run records written to `results/raw_results.csv`.
+  - Merged run records written to `results/raw_results.csv` (17 columns, no malformed rows).
 - `--set all` plans **90 runs**: E1 baseline (10) + E2 delay sweep 0/25/50/100 ms (30) + E3 loss sweep 0/0.5/1/2/5% (50).
 
 ### Phase 3 verification: defects found and fixed
-A line-by-line audit plus independent replay of the committed captures found seven real problems:
+A line-by-line audit plus independent replay of the committed captures found nine real problems. The
+first seven were in the delivered runner; two more surfaced only when re-running from scratch and
+checking the captures against independent ground truth.
 1. **Timeout budget was too small for E3.** The budget divided by the UDP pacing rate for both protocols. Measured E3 worst case (10 MB, 5% loss, 20 ms RTT) = **44.9 s against a 45 s budget**. Replaced with a per-protocol model: Mathis approximation (`BW ≈ MSS/RTT × 1/√p`) for TCP, pacing time for UDP, `max(60, 3×est + 60)`. New budget for that case is **161 s** (3.6× headroom).
 2. **Timeout kills orphaned processes.** `proc.kill()` kills only `sudo`; the root-owned python child kept running inside the namespace (confirmed empirically: the child survived `SIGKILL` to sudo and would corrupt later trials). Now every child starts with `start_new_session=True` and is signalled as a process group via `sudo kill -s SIGKILL -- -PGID`. Verified: forced-timeout run leaves zero processes/sockets behind.
    - Sub-note: `kill -SIGKILL -PGID` silently fails (negative PID parsed as options); the `-s SIG … --` form is required.
@@ -81,7 +84,34 @@ A line-by-line audit plus independent replay of the committed captures found sev
 6. **Retransmission filter spanned both directions.** The capture on `client:c-r` sees server→client traffic too. Filter now restricts to `ip.src == 10.0.1.1`. Re-verified against the old capture: still 34 (the 21 `fast_retransmission` frames are a *subset* of the 34, not additive — no double counting).
 7. **19 MB of `.pcapng` artifacts were committed** because `.gitignore` listed only `*.pcap`. Captures are now untracked and ignored; they stay on disk locally.
 
-Cross-validation holds: for the 1%-loss pilot, tshark and the kernel counter agree exactly (27 = 27), and at 5% loss a 10 MB transfer measured 1.827 Mbps, below the Mathis estimate of 2.61 Mbps — expected, since Mathis ignores RTO backoff.
+Found during the clean-slate redo:
+8. **Captures were silently truncated — wrong retransmission counts.** Stopping tshark by signalling the
+   whole process group delivered *two* SIGINTs (sudo forwards one to its child as well), so tshark
+   aborted before flushing. The file ended 0.25 s before the client finished and the last
+   retransmission was missing: tshark reported **33** where the kernel had **34**. Now a single SIGINT
+   goes to the actual tshark pid (`ip netns exec` execs the command, so sudo's direct child is tshark).
+   Verified: capture duration now matches client duration to ~0.1 ms and captured unique payload bytes
+   equal the payload exactly.
+9. **Server readiness was assumed, not checked.** A fixed `sleep(0.2)` could race the bind and produce
+   `ECONNREFUSED`. Now the runner polls `ss -tln`/`-uln` inside the server namespace until the port is
+   listening (10 s cap) and aborts the trial cleanly if it never appears.
+
+### Independent validation performed on the final artifacts
+- **TCP payload accounting**: unique client payload bytes in the 1%-loss capture = **5,000,000 exactly**;
+  retransmitted bytes account for the remainder. No gaps, no truncation.
+- **TCP retransmissions, two ways**: Wireshark flags match an independent duplicate-`(seq,len)` count
+  (43 = 43, 41 = 41, 35 = 35 across trials). The kernel counter may differ by **±1** in ~1 of 6 trials
+  (observed once, 44 vs 43); this is a kernel accounting artifact, so the capture-based count is treated
+  as authoritative and mismatches are printed as `[WARN]` rather than hidden.
+- **UDP loss, two ways**: the capture shows exactly **4167** data datagrams transmitted while the server
+  counted **4140** received → 27 lost (0.648%), against ~41.7 expected at 1% for that payload; sent +
+  10 END markers = 4177 frames, matching the capture exactly.
+- **Netem delay mapping**: ping RTT measured 20.5 / 50.5 / 200.6 ms for configured delays of 10 / 25 /
+  100 ms, confirming `added_rtt_ms = 2 × delay_ms` is honest.
+- **Cleanup**: after a forced-timeout trial and after a full suite, zero orphan processes and no
+  lingering listeners in either namespace (`TIME-WAIT` only).
+- At 5% loss a 10 MB TCP transfer measured 1.827 Mbps, below the Mathis estimate of 2.61 Mbps —
+  expected, since Mathis ignores RTO backoff.
 
 ## CSV schema (one row per run, assembled by the Phase 3 driver)
 `protocol,delay_ms,added_rtt_ms,loss_pct,trial,payload_bytes,transfer_time_s,client_time_s,goodput_mbps,bytes_delivered,packets_sent,packets_received,loss_pct_obs,duplicates,out_of_order,retrans_tshark,retrans_kernel`

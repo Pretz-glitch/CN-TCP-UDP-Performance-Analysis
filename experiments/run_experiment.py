@@ -164,6 +164,60 @@ def count_tshark_retrans(pcap_path: Path) -> Optional[int]:
     return None
 
 
+def stop_tshark(proc: Optional[subprocess.Popen], timeout: float = 15.0) -> None:
+    """Stop tshark gracefully with exactly ONE SIGINT, then wait for the flush.
+
+    Signalling the whole process group is wrong here: sudo *also* forwards the
+    signal to its child, so tshark receives two SIGINTs and aborts before
+    flushing its buffer. That truncated the tail of the capture (measured: file
+    ended 0.25 s before the client finished, and the last retransmission was
+    missing -> tshark 33 vs kernel 34). `ip netns exec` execs the command, so
+    sudo's direct child IS the tshark process; signal that pid only.
+    """
+    if proc is None or proc.poll() is not None:
+        return
+    prefix = get_prefix()
+    child_pid = None
+    for _ in range(20):
+        res = subprocess.run(prefix + ["pgrep", "-P", str(proc.pid)],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        pids = [p for p in res.stdout.split() if p.isdigit()]
+        if pids:
+            child_pid = pids[0]
+            break
+        time.sleep(0.05)
+    if child_pid:
+        subprocess.run(prefix + ["kill", "-INT", child_pid], check=False)
+    else:
+        subprocess.run(prefix + ["kill", "-INT", str(proc.pid)], check=False)
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        kill_tree(proc, sig=signal.SIGKILL)
+
+
+def wait_for_listener(port: int, protocol: str, proc: subprocess.Popen, timeout: float = 10.0) -> bool:
+    """Poll until the server process is actually accepting on `port`.
+
+    The old runner slept 0.2 s and assumed the bind had happened; a slow start
+    would surface as ECONNREFUSED in the client and a lost trial.
+    """
+    prefix = get_prefix()
+    flag = "-tln" if protocol == "tcp" else "-uln"
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            return False
+        res = subprocess.run(
+            prefix + ["ip", "netns", "exec", "server", "ss", flag],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        )
+        if f":{port}" in res.stdout:
+            return True
+        time.sleep(0.05)
+    return False
+
+
 def estimate_timeout(cfg: "ExperimentConfig") -> float:
     """Generous per-trial timeout budget in seconds.
 
@@ -317,7 +371,10 @@ def run_single_trial(
         text=True,
         start_new_session=True,
     )
-    time.sleep(0.2)  # Allow server to bind and listen
+    if not wait_for_listener(cfg.port, cfg.protocol, server_proc, timeout=10.0):
+        print("  [ERROR] server did not listen within 10s; aborting trial")
+        kill_tree(server_proc)
+        return None
 
     # 5. Start client
     client_script = CLIENT_DIR / f"{cfg.protocol}_client.py"
@@ -371,9 +428,8 @@ def run_single_trial(
         kill_tree(server_proc)
         return None
     finally:
-        # Stop tshark with SIGINT so it flushes the pcap, then force if needed.
-        if tshark_proc and tshark_proc.poll() is None:
-            kill_tree(tshark_proc, sig=signal.SIGINT, grace=8.0)
+        # Stop tshark with a single SIGINT so it flushes the pcap before exiting.
+        stop_tshark(tshark_proc)
         # Any lingering server (e.g. after a parse failure) must not hold the port.
         kill_tree(server_proc, sig=signal.SIGTERM, grace=3.0)
 
@@ -398,6 +454,10 @@ def run_single_trial(
             tshark_count = count_tshark_retrans(pcap_path)
             if tshark_count is not None:
                 retrans_tshark_count = str(tshark_count)
+                if retrans_kernel_count and tshark_count != int(retrans_kernel_count):
+                    print(f"  [WARN] retransmission cross-check differs: "
+                          f"tshark={tshark_count} kernel={retrans_kernel_count} "
+                          f"(delta {int(retrans_kernel_count) - tshark_count})")
 
     # 7. Merge into standard CSV row
     row: Dict[str, str] = {
