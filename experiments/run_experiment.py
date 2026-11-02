@@ -165,25 +165,38 @@ def count_tshark_retrans(pcap_path: Path) -> Optional[int]:
 
 
 def stop_tshark(proc: Optional[subprocess.Popen], timeout: float = 15.0) -> None:
-    """Stop tshark gracefully with exactly ONE SIGINT, then wait for the flush.
+    """Stop the capture process gracefully with exactly ONE SIGINT, then wait.
 
-    Signalling the whole process group is wrong here: sudo *also* forwards the
-    signal to its child, so tshark receives two SIGINTs and aborts before
-    flushing its buffer. That truncated the tail of the capture (measured: file
-    ended 0.25 s before the client finished, and the last retransmission was
-    missing -> tshark 33 vs kernel 34). `ip netns exec` execs the command, so
-    sudo's direct child IS the tshark process; signal that pid only.
+    Failure modes measured and fixed here:
+      * signalling the whole process group -> sudo forwards the signal too, so
+        the child got two SIGINTs and aborted before flushing (tail lost);
+      * tshark (which pipes from a dumpcap child) did not fully drain that pipe
+        on shutdown, losing the capture tail (9,965,136 of 10,000,000 bytes in
+        the 5%-loss trial);
+      * ANY capture left running while the file is read loses its buffered tail.
+        Stop must therefore be preceded by a drain delay (see run_single_trial)
+        and followed by waiting for the process to actually exit.
+    tcpdump is unusable in this environment: the distro's enforcing AppArmor
+    profile for /usr/bin/tcpdump denies signal receipt even to root, so the
+    process cannot be stopped at all. dumpcap is unconfined and flushes.
+    `ip netns exec` execs the command, so sudo's direct child IS the capture
+    process; signal that pid only.
     """
     if proc is None or proc.poll() is not None:
         return
     prefix = get_prefix()
     child_pid = None
-    for _ in range(20):
-        res = subprocess.run(prefix + ["pgrep", "-P", str(proc.pid)],
-                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-        pids = [p for p in res.stdout.split() if p.isdigit()]
-        if pids:
-            child_pid = pids[0]
+    for _ in range(40):
+        # Prefer the actual dumpcap process over a sudo pty helper.
+        for args in (["pgrep", "-P", str(proc.pid), "-x", "dumpcap"],
+                     ["pgrep", "-P", str(proc.pid)]):
+            res = subprocess.run(prefix + args,
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+            pids = [p for p in res.stdout.split() if p.isdigit()]
+            if pids:
+                child_pid = pids[0]
+                break
+        if child_pid:
             break
         time.sleep(0.05)
     if child_pid:
@@ -194,6 +207,19 @@ def stop_tshark(proc: Optional[subprocess.Popen], timeout: float = 15.0) -> None
         proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         kill_tree(proc, sig=signal.SIGKILL)
+        return
+    # Do not return until the capture process itself is gone, otherwise the
+    # pcapng may still be being finalised when the caller copies it.
+    if child_pid:
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            alive = subprocess.run(prefix + ["kill", "-0", child_pid],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if alive.returncode != 0:
+                break
+            time.sleep(0.05)
+        else:
+            subprocess.run(prefix + ["kill", "-s", "SIGKILL", child_pid], check=False)
 
 
 def wait_for_listener(port: int, protocol: str, proc: subprocess.Popen, timeout: float = 10.0) -> bool:
@@ -325,38 +351,49 @@ def run_single_trial(
 
     # 3. Start packet capture (staged in /tmp to avoid root-mount permissions)
     tshark_proc = None
-    tmp_pcap = Path("/tmp") / pcap_name
+    tmp_cap: Optional[Path] = None
     prefix = get_prefix()
     if enable_capture:
         captures_dir.mkdir(parents=True, exist_ok=True)
-        if tmp_pcap.exists():
-            subprocess.run(prefix + ["rm", "-f", str(tmp_pcap)], check=False)
         if pcap_path.exists():
             pcap_path.unlink(missing_ok=True)
-        tshark_cmd = prefix + [
+        # dumpcap, not tcpdump/tshark. Measured on this box with a 100-packet
+        # control run, stopping the capture with SIGINT:
+        #   tshark (pipes from dumpcap) : lost ~25 ms, and at 5% loss 34,864 of
+        #                                 10,000,000 bytes (9,965,136 captured)
+        #   dumpcap, read immediately   : 85-100 of 100 packets
+        #   dumpcap, 1.5 s drain first  : 100 of 100 packets, three times
+        # tcpdump is NOT usable here: the distro ships an enforcing AppArmor
+        # profile for /usr/bin/tcpdump that denies signal receipt even to root,
+        # so the process can never be stopped (verified in the audit log).
+        # dumpcap is unconfined, flushes on SIGINT, and writes pcapng natively.
+        tmp_cap = Path("/tmp") / pcap_name
+        if tmp_cap.exists():
+            subprocess.run(prefix + ["rm", "-f", str(tmp_cap)], check=False)
+        capture_cmd = prefix + [
             "ip", "netns", "exec", "client",
-            "tshark", "-i", "c-r", "-w", str(tmp_pcap), "-q"
+            "dumpcap", "-i", "c-r", "-w", str(tmp_cap), "-q"
         ]
         tshark_proc = subprocess.Popen(
-            tshark_cmd,
+            capture_cmd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
-        # Wait until tshark has actually created the file instead of guessing a
-        # fixed sleep: a slow attach would silently truncate the start of the run
-        # (the SYN and first segments).
+        # Wait until the capture tool has actually created the file instead of
+        # guessing a fixed sleep: a slow attach would silently truncate the start
+        # of the run (the SYN and first segments).
         deadline = time.time() + 10.0
         while time.time() < deadline:
-            if tmp_pcap.exists() and tmp_pcap.stat().st_size > 0:
+            if tmp_cap.exists() and tmp_cap.stat().st_size > 0:
                 break
             if tshark_proc.poll() is not None:
-                print("  [WARN] tshark exited during startup; capture disabled for this run")
+                print("  [WARN] capture process exited during startup; capture disabled for this run")
                 tshark_proc = None
                 break
             time.sleep(0.05)
         else:
-            print("  [WARN] tshark did not create the capture file within 10s")
+            print("  [WARN] capture process did not create the capture file within 10s")
 
     # 4. Start server
     server_script = SERVER_DIR / f"{cfg.protocol}_server.py"
@@ -428,20 +465,27 @@ def run_single_trial(
         kill_tree(server_proc)
         return None
     finally:
-        # Stop tshark with a single SIGINT so it flushes the pcap before exiting.
+        # Drain delay BEFORE stopping: dumpcap writes through an internal buffer
+        # and packets still in it are lost on SIGINT. With no delay a 100-packet
+        # control run yielded 85-100/100; with 1.5 s it was 100/100 three times.
+        # The client has already exited here, so all payload has crossed the
+        # interface; this waits for the writer, not for the network.
+        if enable_capture:
+            time.sleep(1.5)
+        # Single SIGINT to the capture process; waits for it to fully exit.
         stop_tshark(tshark_proc)
         # Any lingering server (e.g. after a parse failure) must not hold the port.
         kill_tree(server_proc, sig=signal.SIGTERM, grace=3.0)
 
-        # Move staged capture from /tmp to captures/
-        if enable_capture and tmp_pcap.exists():
+        # Move the staged pcapng from /tmp into captures/.
+        if enable_capture and tmp_cap is not None and tmp_cap.exists():
             try:
-                subprocess.run(prefix + ["chmod", "666", str(tmp_pcap)], check=False)
-                shutil.copyfile(str(tmp_pcap), str(pcap_path))
-                subprocess.run(prefix + ["rm", "-f", str(tmp_pcap)], check=False)
+                subprocess.run(prefix + ["chmod", "666", str(tmp_cap)], check=False)
+                shutil.copyfile(str(tmp_cap), str(pcap_path))
+                subprocess.run(prefix + ["rm", "-f", str(tmp_cap)], check=False)
                 os.chmod(pcap_path, 0o666)
             except Exception as e:
-                print(f"  [WARN] Failed to move capture from {tmp_pcap} to {pcap_path}: {e}")
+                print(f"  [WARN] Failed to move capture {tmp_cap} to {pcap_path}: {e}")
 
     # 6. Retransmission metrics
     retrans_kernel_count = ""
