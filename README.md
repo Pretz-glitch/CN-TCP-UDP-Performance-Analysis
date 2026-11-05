@@ -151,20 +151,23 @@ Found during the clean-slate redo:
 | Set | Condition | TCP goodput | UDP goodput | Notes |
 |---|---|---|---|---|
 | E1 | 0 ms RTT, 0% loss | 9.572 Mbps | 7.771 Mbps | 0 retrans, 0% UDP loss |
-| E2 | 50 ms RTT | 9.181 Mbps | 7.771 Mbps | TCP xfer 1.743 s |
-| E2 | 100 ms RTT | 8.426 Mbps | 7.771 Mbps | TCP xfer 1.899 s |
+| E2 | 50 ms RTT | 9.182 Mbps | 7.771 Mbps | TCP xfer 1.743 s |
+| E2 | 100 ms RTT | 8.427 Mbps | 7.771 Mbps | TCP xfer 1.899 s |
 | E2 | 200 ms RTT | 6.932 Mbps | 7.771 Mbps | TCP xfer 2.308 s |
 | E3 | 0% loss | 9.555 Mbps | 7.768 Mbps | 0 retrans; UDP 0.00% obs |
-| E3 | 0.5% loss | 7.714 Mbps | 7.731 Mbps | 35 retrans; UDP 0.48% obs |
-| E3 | 1% loss | 5.451 Mbps | 7.691 Mbps | 72 retrans; UDP 0.99% obs |
-| E3 | 2% loss | 3.458 Mbps | 7.614 Mbps | 140 retrans; UDP 1.98% obs |
-| E3 | 5% loss | 1.777 Mbps | 7.388 Mbps | 371 retrans; UDP 4.89% obs |
+| E3 | 0.5% loss | 8.376 Mbps | 7.727 Mbps | 30 retrans; UDP 0.53% obs |
+| E3 | 1% loss | 5.674 Mbps | 7.691 Mbps | 65 retrans; UDP 0.99% obs |
+| E3 | 2% loss | 3.507 Mbps | 7.618 Mbps | 140 retrans; UDP 1.93% obs |
+| E3 | 5% loss | 1.746 Mbps | 7.387 Mbps | 371 retrans; UDP 4.90% obs |
 
 Key observations: UDP throughput is flat in RTT and loss because it is open-loop paced at 8 Mbit/s;
 its measured loss tracks the configured value to within sampling noise. TCP throughput degrades with
 both RTT (congestion window takes longer to grow) and loss (retransmissions and RTO backoff), and
-retransmissions rise monotonically with loss. At 5% loss TCP delivers 1.78 Mbps, below the Mathis
+retransmissions rise monotonically with loss. At 5% loss TCP delivers 1.75 Mbps, below the Mathis
 estimate (~3 Mbps with `1.22/√p`) because Mathis ignores RTO backoff.
+
+The dataset on this branch was regenerated end-to-end on 2026-11-04 (a clean 90-run sweep) and
+revalidated; the table above and all Phase 5 graphs use that run.
 
 ### Phase 4 verification (independent of the runner)
 `analysis/validate_results.py` hard-codes the roadmap plan rather than reusing the runner's plan. It
@@ -172,6 +175,26 @@ confirms: exactly 90 rows/18 conditions/5 trials per protocol, 17-column schema,
 0% loss, UDP observed loss within 4σ of configured at every point, monotonic expected trends, and for
 all 90 captures: filename/coverage match, capture duration ≥ client duration, exact TCP byte coverage
 and exact UDP datagram/END-marker counts. Result: **PASS, 0 warnings**. No orphan processes remained.
+
+## Phase 5 results (analysis + graphs)
+`analysis/graphs.py` builds the five required graphs from `results/raw_results.csv`; every point is the
+mean of 5 trials and every error bar is the 95% confidence interval (`1.96·SD/√n`). Outputs are in
+`graphs/` at 200 dpi.
+
+| # | File | What it shows | Result |
+|---|---|---|---|
+| 1 | `01_baseline_goodput.png` | Baseline goodput, TCP vs UDP | TCP **9.57** vs UDP **7.77 Mbit/s** at 0 ms / 0% |
+| 2 | `02_transfer_time_vs_rtt.png` | Transfer time vs added RTT | TCP **1.672 → 2.308 s** from 0 → 200 ms; UDP flat at **2.059 s** |
+| 3 | `03_goodput_vs_loss.png` | Goodput vs loss, with Mathis overlay | TCP **9.56 → 1.75 Mbit/s** from 0 → 5%; UDP **7.77 → 7.39** |
+| 4 | `04_tcp_retransmissions_vs_loss.png` | TCP retransmissions vs loss | **0 → 30 → 65 → 140 → 371** segments |
+| 5 | `05_udp_observed_vs_configured_loss.png` | UDP observed vs configured loss | **0.53 / 0.99 / 1.93 / 4.90%** against 0.5 / 1 / 2 / 5% |
+
+- The Mathis curve is plotted with MSS = 1448 B and RTT = 20 ms (the E3 added RTT):
+  `BW = (MSS/RTT) · 1.22/√p`. Measured TCP lies below it and diverges as loss rises, because Mathis
+  assumes only fast retransmit and ignores RTO backoff and the 10 Mbit/s bottleneck.
+- Processed numbers for the report are in `results/summary.csv` (18 conditions, mean/SD/95% CI).
+- `analysis/validate_results.py` re-checks the raw CSV and all 90 captures against the roadmap spec
+  independently of the runner.
 
 ## CSV schema (one row per run, assembled by the Phase 3 driver)
 `protocol,delay_ms,added_rtt_ms,loss_pct,trial,payload_bytes,transfer_time_s,client_time_s,goodput_mbps,bytes_delivered,packets_sent,packets_received,loss_pct_obs,duplicates,out_of_order,retrans_tshark,retrans_kernel`
