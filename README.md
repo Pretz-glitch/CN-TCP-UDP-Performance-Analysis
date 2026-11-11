@@ -7,8 +7,8 @@ Course: Computer Networks | Platform: Linux (Kubuntu) | Language: Python 3
 - [x] Phase 1: Topology + bare transfers (see below)
 - [x] Phase 2: Real instrumentation (see below)
 - [x] Phase 3: Automation + pilot (see below)
-- [ ] Phase 4: Full experiment sweeps (E1–E3)
-- [ ] Phase 5: Analysis and graphs
+- [x] Phase 4: Full experiment sweeps (E1–E3)
+- [x] Phase 5: Analysis and graphs
 - [ ] Phase 6: Report
 - [ ] Phase 7: Slides + demo
 
